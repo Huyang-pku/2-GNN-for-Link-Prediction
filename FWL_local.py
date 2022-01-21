@@ -12,11 +12,9 @@ import torch.nn.functional as F
 from torch_geometric.datasets import Planetoid
 from torch_geometric.utils import dropout_adj
 import torch_geometric.transforms as T
-from torch_geometric.nn import GCNConv, ChebConv, SAGEConv  # noqa
+from torch_geometric.nn import SAGEConv  # noqa
 from torch_scatter import scatter_mean
-from scipy.sparse import coo_matrix
 from matmul import matmul
-import random
 from copy import deepcopy
 import warnings
 import time
@@ -108,9 +106,7 @@ def compute_D(self_loop = False):
         i, k = data.edge_index[:,t]
         for j in range(tailed_size):
             D_dense[i,j,k] = 1
-            #D_dense[k,j,i] = 1
             D_dense[j,i,k] = 1
-            #D_dense[j,k,i] = 1
     if self_loop:
         for i in range(tailed_size):
             for j in range(tailed_size):
