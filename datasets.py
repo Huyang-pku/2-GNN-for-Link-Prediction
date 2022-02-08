@@ -1,40 +1,33 @@
-from dataset_SEAL import load
-from utils import get_ei2, idx2mask, blockei2
+from dataset_SEAL import do_edge_split, load
+from utils import edgegraph, degree
 import torch
 import numpy as np
 from torch_geometric.utils import to_undirected, is_undirected
-from utils import double
+from torch_geometric.datasets import Planetoid
+import torch_geometric.transforms as T
 
 
-class dataset:
-    def __init__(self, x, ei, ea, pos1, y, ei2):
+class Dataset:
+    def __init__(self, x, ei, pos1, y, neg_pos1):
         self.x = x
         self.ei = ei
-        self.ea = ea
         self.pos1 = pos1
         self.y = y
-        self.ei2 = ei2
+        self.neg_pos1 = neg_pos1
 
 
 class BaseGraph:
     def __init__(self, x, edge_pos, edge_neg, num_pos, num_neg):
         self.x = x
+        self.xs = None
         self.edge_pos = edge_pos
         self.edge_neg = edge_neg
         self.num_pos = num_pos
         self.num_neg = num_neg
         self.num_nodes = x.shape[0]
+        self.max_x = None
 
     def preprocess(self):
-        self.edge_indexs = [
-            self.edge_pos[:, :self.num_pos[0]],
-            self.edge_pos[:, :self.num_pos[0]],
-            self.edge_pos[:, :self.num_pos[0] + self.num_pos[1]]
-        ]
-        self.edge_attrs = [
-            torch.ones_like(self.edge_indexs[i][0], dtype=torch.float)
-            for i in range(3)
-        ]
         pos_edges = [
             self.edge_pos[:, :self.num_pos[0]],
             self.edge_pos[:,
@@ -48,63 +41,49 @@ class BaseGraph:
             self.edge_neg[:, -self.num_neg[2]:]
         ]
 
-        pred_edges = [neg_edges[0]] + [
-            torch.cat((pos_edges[i], neg_edges[i]), dim=1)
-            for i in range(1, 3)
+        pred_edges = [
+            torch.cat((pos_edges[i], neg_edges[i]), dim=1) for i in range(3)
         ]
 
-        self.pos1s = [
-            torch.cat((self.edge_indexs[i].t(), pred_edges[i].t()), dim=0)
-            for i in range(3)
-        ]
+        self.edge_indexs = [pos_edges[0], pos_edges[0], pos_edges[0]]
 
-        self.ys = [torch.zeros((neg_edges[0].shape[1], 1),
-                                 device=self.edge_pos.device)]+[
+        self.pos1s = [pos_edges[0].t()
+                      ] + [pred_edges[i].t() for i in range(1, 3)]
+
+        self.ys = [
             torch.cat((torch.ones((pos_edges[i].shape[1], 1),
                                   dtype=torch.float,
                                   device=self.edge_pos.device),
                        torch.zeros((neg_edges[i].shape[1], 1),
                                    dtype=torch.float,
                                    device=self.edge_pos.device)))
-            for i in range(1, 3)
+            for i in range(3)
         ]
-        self.ei2s = [
-            get_ei2(self.num_nodes, self.edge_indexs[0], pred_edges[0]),
-            get_ei2(self.num_nodes, self.edge_indexs[1], pred_edges[1]),
-            get_ei2(self.num_nodes, self.edge_indexs[2], pred_edges[2])
-        ]
+        self.edge_indexs = [to_undirected(i) for i in self.edge_indexs]
 
     def split(self, split: int):
-        return self.x[split], self.edge_indexs[split], self.edge_attrs[
-            split], self.pos1s[split], self.ys[split], self.ei2s[split]
+        if self.xs is None:
+            self.xs = [self.x for i in range(3)]
+        neg_pos1 = self.edge_neg.t()[:self.num_neg[0]] if split == 0 else None
+        return self.xs[split], self.edge_indexs[split], self.pos1s[
+            split], self.ys[split], neg_pos1
 
     def setPosDegreeFeature(self):
-        #print(self.edge_indexs[0], self.edge_attrs[0], (self.x.shape[0], self.x.shape[0]))
-        adj = [
-            torch.sparse_coo_tensor(self.edge_indexs[0], self.edge_attrs[0],
-                                      (self.x.shape[0], self.x.shape[0])),
-            torch.sparse_coo_tensor(self.edge_indexs[1], self.edge_attrs[1],
-                                    (self.x.shape[0], self.x.shape[0])),
-            torch.sparse_coo_tensor(self.edge_indexs[2], self.edge_attrs[2],
-                                    (self.x.shape[0], self.x.shape[0]))
+        tedge = torch.cat(
+            (self.pos1s[0].t(), self.pos1s[0].t()[[1, 0]]), dim=-1)
+        self.xs = [
+            degree(tedge, self.num_nodes) for i in range(3)
         ]
-        degree = [
-            torch.sparse.sum(adj[0], dim=1).to_dense().to(torch.int64),
-            torch.sparse.sum(adj[1], dim=1).to_dense().to(torch.int64),
-            torch.sparse.sum(adj[2], dim=1).to_dense().to(torch.int64)
-        ]
-        self.x = [
-            degree[0].reshape(self.x.shape[0], 1),
-            degree[1].reshape(self.x.shape[0], 1),
-            degree[2].reshape(self.x.shape[0], 1),
-        ]
+        self.max_x = max([torch.max(_).item() for _ in self.xs])
 
     def setPosOneFeature(self):
-        self.x = torch.ones((self.x.shape[0], 1), dtype=torch.int64)
+        self.x = torch.ones((self.num_nodes, 1), dtype=torch.int64)
+        self.max_x = 1
 
     def setPosNodeIdFeature(self):
-        self.x = torch.arange(self.x.shape[0],
+        self.x = torch.arange(self.num_nodes,
                               dtype=torch.int64).reshape(self.x.shape[0], 1)
+        self.max_x = self.num_nodes - 1
 
     def to_undirected(self):
         if not is_undirected(self.edge_pos):
@@ -117,7 +96,7 @@ class BaseGraph:
         return self
 
 
-def load_dataset(name, trn_ratio=0.8, val_ratio=0.05, test_ratio=0.1):
+def load_dataset(name, trn_ratio=0.85, val_ratio=0.05, test_ratio=0.1):
     if name in [
             "arxiv", "Celegans", "Ecoli", "NS", "PB", "Power", "Router",
             "USAir", "Yeast", "Wikipedia"
@@ -131,14 +110,12 @@ def load_dataset(name, trn_ratio=0.8, val_ratio=0.05, test_ratio=0.1):
             "max_train_num": 1000000000
         })
 
-
-        train_pos = double(split_edge['train']['edge'])
-        train_neg = double(split_edge['train']['edge_neg'])
-        val_pos = double(split_edge["valid"]["edge"])
-        val_neg = double(split_edge["valid"]["edge_neg"])
-        test_pos = double(split_edge["test"]["edge"])
-        test_neg = double(split_edge["test"]["edge_neg"])
-
+        train_pos = split_edge['train']['edge']
+        train_neg = split_edge['train']['edge_neg']
+        val_pos = split_edge["valid"]["edge"]
+        val_neg = split_edge["valid"]["edge_neg"]
+        test_pos = split_edge["test"]["edge"]
+        test_neg = split_edge["test"]["edge_neg"]
 
         edge_pos = torch.cat((train_pos, val_pos, test_pos), dim=-1)
         edge_neg = torch.cat((train_neg, val_neg, test_neg), dim=-1)
@@ -148,8 +125,25 @@ def load_dataset(name, trn_ratio=0.8, val_ratio=0.05, test_ratio=0.1):
             [train_neg.shape[1], val_neg.shape[1], test_neg.shape[1]])
         n_node = max(torch.max(edge_pos), torch.max(edge_neg)) + 1
         x = torch.empty((n_node, 0))
-        print(num_pos)
-        print(num_neg)
         return BaseGraph(x, edge_pos, edge_neg, num_pos, num_neg)
+    elif name in ["Cora", "Citeseer", "Pubmed"]:
+        datasets = Planetoid(f"./dataset/{name}", name, transform=T.NormalizeFeatures())
+        data = datasets[0]
+        mask = data.edge_index[0] < data.edge_index[1]
+        data.edge_index = data.edge_index[:, mask]
+        split_edge = do_edge_split(data, val_ratio, test_ratio)
+        train_pos = split_edge['train']['edge']
+        train_neg = split_edge['train']['edge_neg']
+        val_pos = split_edge["valid"]["edge"]
+        val_neg = split_edge["valid"]["edge_neg"]
+        test_pos = split_edge["test"]["edge"]
+        test_neg = split_edge["test"]["edge_neg"]
+        edge_pos = torch.cat((train_pos, val_pos, test_pos), dim=-1)
+        edge_neg = torch.cat((train_neg, val_neg, test_neg), dim=-1)
+        num_pos = torch.tensor(
+            [train_pos.shape[1], val_pos.shape[1], test_pos.shape[1]])
+        num_neg = torch.tensor(
+            [train_neg.shape[1], val_neg.shape[1], test_neg.shape[1]])
+        return BaseGraph(data.x, edge_pos, edge_neg, num_pos, num_neg)
     else:
         raise NotImplementedError

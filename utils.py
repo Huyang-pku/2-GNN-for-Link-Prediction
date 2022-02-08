@@ -1,8 +1,13 @@
 import torch
 from torch import Tensor
-from torch_geometric.nn.conv import edge_conv
-from torch_geometric.utils.convert import to_cugraph
-from torch_sparse.tensor import to
+from torch_geometric.utils import to_undirected, remove_self_loops
+from torch_scatter import scatter_add
+import math
+
+
+@torch.jit.script
+def degree(ei: Tensor, num_node: int):
+    return scatter_add(torch.ones_like(ei[1]), ei[1], dim_size=num_node)
 
 
 @torch.jit.script
@@ -15,164 +20,102 @@ def set_mul(a: Tensor, b: Tensor):
 
 
 @torch.jit.script
-def check_in_set(target, set):
+def check_in_set(target: Tensor, set: Tensor):
     # target (n,), set(m,)
     a = target.reshape(-1, 1)
     b = set.reshape(1, -1)
     out = []
-    cutshape = 1024 * 1024 * 1024 // b.shape[1]
+    cutshape = (1 << 28) // b.shape[1]
     out = torch.cat([
-        torch.sum((a[i:i + cutshape] == b), dim=-1)
+        torch.sum((a[i:i + cutshape] == b), dim=-1, dtype=torch.bool)
         for i in range(0, a.shape[0], cutshape)
     ])
     return out
 
 
 @torch.jit.script
-def get_ei2(n_node: int, pos_edge, pred_edge):
-    edge = torch.cat((pos_edge, pred_edge), dim=-1)  #pos.transpose(0, 1)
-    idx = torch.arange(edge.shape[1], device=edge.device)
-    idx_pos = torch.arange(pos_edge.shape[1], device=edge.device)
-    edge2 = [
-        set_mul(idx_pos[pos_edge[1] == i], idx[edge[0] == i])
-        for i in range(n_node)
-    ]
-    return torch.cat(edge2, dim=0).t()
+def edgegraph(pos1: Tensor):
+    n_node1 = pos1.shape[0]
+    idx1 = torch.arange(n_node1, device=pos1.device)
+    cutshape = (1 << 24) // pos1.shape[0]
+    edge2 = []
+    pos_b = pos1.t().unsqueeze(-2)[[0, 1, 0, 1]]  # (4, 1, -1)
+    for i in range(0, n_node1, cutshape):
+        idx_a = idx1[i:i + cutshape]
+        pos_a = pos1[i:i + cutshape].t().unsqueeze(-1)[[0, 0, 1, 1]
+                                                       ]  # (4, -1, 1)
+        tpos = torch.sum(pos_a == pos_b, dim=0, dtype=torch.bool).flatten()
+        edge2.append(set_mul(idx_a, idx1)[tpos])
+    edge2 = torch.cat(edge2, dim=0).t()
+    return remove_self_loops(edge2)[0]
 
 
 @torch.jit.script
-def blockei2(ei2, blocked_idx):
-    return ei2[:, torch.logical_not(check_in_set(ei2[0], blocked_idx))]
+def partial_edgegraph(pos1: Tensor, pos2: Tensor):
+    n_node1 = pos1.shape[0]
+    n_node2 = pos2.shape[0]
+    idx1 = torch.arange(n_node1, device=pos1.device)
+    idx2 = n_node1 + torch.arange(n_node2, device=pos1.device)
+    cutshape = (1 << 24) // pos2.shape[0]
+    edge2 = []
+    pos_b = pos2.t().unsqueeze(-2)[[0, 1, 0, 1]]
+    for i in range(0, n_node1, cutshape):
+        idx_a = idx1[i:i + cutshape]
+        pos_a = pos1[i:i + cutshape].t().unsqueeze(-1)[[0, 0, 1, 1]]
+        tpos = torch.sum(pos_a == pos_b, dim=0, dtype=torch.bool).flatten()
+        edge2.append(set_mul(idx_a, idx2)[tpos])
+    edge2 = torch.cat(edge2, dim=0).t()
+    return edge2
+
+
+def enlarge_edgegraph(ei2: Tensor, pos1: Tensor, pos2: Tensor):
+    pei2 = to_undirected(partial_edgegraph(pos1, pos2))
+    ei22 = to_undirected(pos1.shape[0] + edgegraph(pos2))
+    return torch.cat((ei2, pei2, ei22), dim=1)
 
 
 @torch.jit.script
-def idx2mask(num: int, idx):
+def idx2mask(num: int, idx: Tensor):
     mask = torch.zeros((num), device=idx.device, dtype=torch.bool)
     mask[idx] = True
     return mask
 
 
 @torch.jit.script
-def mask2idx(mask):
+def mask2idx(mask: Tensor):
     idx = torch.arange(mask.shape[0], device=mask.device)
     return idx[mask]
 
 
-#@torch.jit.script
-def sample_block(sample_idx, ea, size, ei, ei2):
-    ea_new = ea[torch.logical_not(idx2mask(ei.shape[1], sample_idx))]
-    ei_new = ei[:, torch.logical_not(idx2mask(ei.shape[1], sample_idx))]
-    pos_pos_new = ei[:, sample_idx].t()
-    ei2_new = blockei2(ei2, sample_idx)
-    #print(ei_new, ea_new, (size, size))
-    adj = torch.sparse_coo_tensor(ei_new, ea_new, (size, size))
-    x_new = torch.sparse.sum(adj, dim=1).to_dense().to(torch.int64).reshape(size, 1)
-    return ei_new, x_new, pos_pos_new, ei2_new
-
-import math
-
-from torch_geometric.utils import to_undirected
-from torch_geometric.deprecation import deprecated
-
-def double(x, for_index = False):
-    if not for_index:
-        row, col = x[0].reshape(1, x.shape[1]), x[1].reshape(1, x.shape[1])
-        x = torch.cat([row, col, col, row], 0).t()
-        x = x.reshape(-1, 2).t()
-    else:
-        x = x.reshape(1, x.shape[0])
-        x = torch.cat([2 * x, 2 * x + 1], 0).t()
-        x = x.reshape(-1, 1).t().squeeze()
-    return x
 
 
-def random_split_edges(data, val_ratio: float = 0.05,
-                           test_ratio: float = 0.1):
-    r"""Splits the edges of a :class:`torch_geometric.data.Data` object
-    into positive and negative train/val/test edges.
-    As such, it will replace the :obj:`edge_index` attribute with
-    :obj:`train_pos_edge_index`, :obj:`train_pos_neg_adj_mask`,
-    :obj:`val_pos_edge_index`, :obj:`val_neg_edge_index` and
-    :obj:`test_pos_edge_index` attributes.
-    If :obj:`data` has edge features named :obj:`edge_attr`, then
-    :obj:`train_pos_edge_attr`, :obj:`val_pos_edge_attr` and
-    :obj:`test_pos_edge_attr` will be added as well.
-
-    .. warning::
-
-        :meth:`~torch_geometric.utils.train_test_split_edges` is deprecated and
-        will be removed in a future release.
-        Use :class:`torch_geometric.transforms.RandomLinkSplit` instead.
-
-    Args:
-        data (Data): The data object.
-        val_ratio (float, optional): The ratio of positive validation edges.
-            (default: :obj:`0.05`)
-        test_ratio (float, optional): The ratio of positive test edges.
-            (default: :obj:`0.1`)
-
-    :rtype: :class:`torch_geometric.data.Data`
-    """
-
-    assert 'batch' not in data  # No batch-mode.
-
-    num_nodes = data.num_nodes
-    row, col = data.edge_index
-    edge_attr = data.edge_attr
-    data.edge_index = data.edge_attr = None
-
-    # Return upper triangular portion.
-    mask = row < col
-    row, col = row[mask], col[mask]
-
-    if edge_attr is not None:
-        edge_attr = edge_attr[mask]
-
-    n_v = int(math.floor(val_ratio * row.size(0)))
-    n_t = int(math.floor(test_ratio * row.size(0)))
-
-    # Positive edges.
-    perm = torch.randperm(row.size(0))
-    row, col = row[perm], col[perm]
-    if edge_attr is not None:
-        edge_attr = edge_attr[perm]
-
-    r, c = row[:n_v], col[:n_v]
-    data.val_pos_edge_index = torch.stack([r, c], dim=0)
-    if edge_attr is not None:
-        data.val_pos_edge_attr = edge_attr[:n_v]
-
-    r, c = row[n_v:n_v + n_t], col[n_v:n_v + n_t]
-    data.test_pos_edge_index = torch.stack([r, c], dim=0)
-    if edge_attr is not None:
-        data.test_pos_edge_attr = edge_attr[n_v:n_v + n_t]
-
-    r, c = row[n_v + n_t:], col[n_v + n_t:]
-    data.train_pos_edge_index = torch.stack([r, c], dim=0)
+@torch.jit.script
+def setmul4compute_D(a, b, c):
     '''
-    if edge_attr is not None:
-        out = to_undirected(data.train_pos_edge_index, edge_attr[n_v + n_t:])
-        data.train_pos_edge_index, data.train_pos_edge_attr = out
-    else:
-        data.train_pos_edge_index = to_undirected(data.train_pos_edge_index)
+    shape:
+        a : (m)
+        b : (m)
+        c : (n)
     '''
+    m = a.shape[0]
+    n = c.shape[0]
+    na = a.unsqueeze(1).expand(-1, n).flatten()
+    nb = b.unsqueeze(1).expand(-1, n).flatten()
+    nc = c.unsqueeze(0).expand(m, -1).flatten()
+    return torch.stack((na, nb, nc))
 
-    # Negative edges.
-    neg_adj_mask = torch.ones(num_nodes, num_nodes, dtype=torch.uint8)
-    neg_adj_mask = neg_adj_mask.triu(diagonal=1).to(torch.bool)
-    neg_adj_mask[row, col] = 0
 
-    neg_row, neg_col = neg_adj_mask.nonzero(as_tuple=False).t()
-    perm = torch.randperm(neg_row.size(0))[:n_v + n_t]
-    neg_row, neg_col = neg_row[perm], neg_col[perm]
-
-    neg_adj_mask[neg_row, neg_col] = 0
-    data.train_neg_adj_mask = neg_adj_mask
-
-    row, col = neg_row[:n_v], neg_col[:n_v]
-    data.val_neg_edge_index = torch.stack([row, col], dim=0)
-
-    row, col = neg_row[n_v:n_v + n_t], neg_col[n_v:n_v + n_t]
-    data.test_neg_edge_index = torch.stack([row, col], dim=0)
-
-    return data
+@torch.jit.script
+def compute_D(ei, num_node: int, self_loop: bool=True):
+    vec_i, vec_k = ei[0], ei[1]
+    vec_j = torch.arange(num_node, device=ei.device)
+    tD = setmul4compute_D(vec_i, vec_k, vec_j)
+    D = torch.cat((tD[[0, 2, 1]], tD[[2, 0, 1]]), dim=-1)
+    if self_loop:
+        vec_i = torch.arange(num_node, device=ei.device)
+        vec_j = vec_i
+        vec_k = vec_i
+        tD = setmul4compute_D(vec_i, vec_i, vec_j)
+        D = torch.cat((D, tD[[0, 2, 1]], tD[[2, 0, 1]]), dim=-1)
+    D = torch.unique(D, dim=-1)
+    return D

@@ -1,84 +1,69 @@
-from math import e
-from scipy.sparse import data
-from sklearn import utils
-from model import WLGNN, Model_HY
-from datasets import load_dataset, dataset
+import random
+from model import Net
+from datasets import load_dataset, Dataset
 import torch
-from torch import nn
 import torch.nn.functional as F
 from torch.optim import Adam
 from sklearn.metrics import roc_auc_score
 import time
-from utils import sample_block, double
+from utils import idx2mask, degree
 import optuna
+import numpy as np
 
 
-def train(mod, opt, dataset, batch_size, mask0):
-    perm1 = torch.randperm(dataset.ei.shape[1]//2, device=dataset.x.device)
-    perm2 = torch.randperm((dataset.pos1.shape[0] - dataset.ei.shape[1])//2,
-                           device=dataset.x.device)
-    out = []
-    scores = []
+def set_seed(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)  # multi gpu
+
+
+perm1, perm2, pos_batchsize, neg_batchsize = None, None, None, None
+
+
+def train(mod, opt, dataset, batch_size, i):
+    global perm1, perm2, pos_batchsize, neg_batchsize
     mod.train()
-    pos_batchsize = batch_size // 2
-    neg_batchsize = (dataset.pos1.shape[0] - dataset.ei.shape[1])//(dataset.ei.shape[1]//pos_batchsize)
-    mask1 = ~mask0
+    if i == 0:
+        perm1 = torch.randperm(dataset.pos1.shape[0], device=dataset.x.device)
+        perm2 = torch.randperm(dataset.neg_pos1.shape[0],
+                               device=dataset.x.device)
+        pos_batchsize = batch_size // 2
+        neg_batchsize = (perm2.shape[0]) // (dataset.ei.shape[1] //
+                                             pos_batchsize)
 
-    for i in range(perm1.shape[0] // pos_batchsize):
-        idx1 = perm1[i * pos_batchsize:(i + 1) * pos_batchsize]
-        idx2 = perm2[i * neg_batchsize:(i + 1) * neg_batchsize]
-        y = torch.cat((torch.ones_like(idx1, dtype=torch.float),
-                       torch.zeros_like(idx2, dtype=torch.float)),
-                      dim=0).unsqueeze(-1)
-
-        idx1 = double(idx1, for_index = True)
-        idx2 = double(idx2, for_index = True)
-        length = idx1.shape[0] + idx2.shape[0]
-        #import pdb
-        #pdb.set_trace()
-        mask0 = mask0[:length]
-        mask1 = mask1[:length]
-
-        new_ei, new_x, pos_pos, new_ei2 = sample_block(idx1, dataset.ea, dataset.x.shape[0], dataset.ei, dataset.ei2)
-        opt.zero_grad()
-        pos2 = torch.cat((idx1, dataset.ei.shape[1] + idx2), dim=0)
-        pred = mod(new_x, new_ei, new_ei2, dataset.pos1, pos2, mask0, mask1)
-        loss = F.binary_cross_entropy_with_logits(pred, y)
-        loss.backward()
-        opt.step()
-        out.append(loss.item())
-        with torch.no_grad():
-            sig = pred.sigmoid().cpu().numpy()
-            score = roc_auc_score(y.cpu().numpy(), sig)
-        scores.append(score)
-    print(f"trn score {sum(scores)/len(scores)}", end=" ")
-    return sum(out) / len(out)
+    idx1 = perm1[i * pos_batchsize:(i + 1) * pos_batchsize]
+    idx2 = perm2[i * neg_batchsize:(i + 1) * neg_batchsize]
+    neg_pos1 = dataset.neg_pos1[idx2]
+    y = torch.cat((torch.ones_like(
+        idx1, dtype=torch.float), torch.zeros_like(idx2, dtype=torch.float)),
+        dim=0).unsqueeze(-1)
+    delei = dataset.pos1[idx1].t()
+    delei = torch.cat((delei, delei[[1, 0]]), dim=-1)
+    x = dataset.x - degree(delei, dataset.x.shape[0])
+    eimask = torch.logical_not(idx2mask(perm1.shape[0], idx1))
+    ei = dataset.pos1[eimask].t()
+    ei = torch.cat((ei, ei[[1, 0]]), dim=-1)
+    pos1 = torch.cat((dataset.pos1[idx1], neg_pos1), dim=0)
+    opt.zero_grad()
+    pred = mod(x, ei, pos1)
+    loss = F.binary_cross_entropy_with_logits(pred, y)
+    loss.backward()
+    opt.step()
+    i += 1
+    if (i + 1) * pos_batchsize > perm1.shape[0]:
+        i = 0
+    return loss.item(), i
 
 
 @torch.no_grad()
-def test(mod, dataset, mask0):
+def test(mod, dataset):
     mod.eval()
-    mask0 = mask0[:dataset.y.shape[0]]
-    mask1 = ~mask0
-    pred = mod(
-        dataset.x, dataset.ei, dataset.ei2, dataset.pos1, dataset.ei.shape[1] +
-        torch.arange(dataset.y.shape[0], device=dataset.x.device), mask0, mask1)
+    pred = mod(dataset.x, dataset.ei, dataset.pos1).flatten()
     sig = pred.sigmoid().cpu().numpy()
-    return roc_auc_score(dataset.y[mask0].cpu().numpy(), sig)
-
-
-def main(device="cpu", dsname="Celegans", mod_params=(32, 2, 1, 0.0), lr=3e-4):
-    device = torch.device(device)
-    bg = load_dataset(dsname)
-    bg.to(device)
-    bg.preprocess()
-    bg.setPosDegreeFeature()
-    mod = WLGNN(torch.max(bg.x), *mod_params).to(device)
-    opt = Adam(mod.parameters(), lr=lr)
-    trn_ds = dataset(*bg.split(0))
-    val_ds = dataset(*bg.split(1))
-    tst_ds = dataset(*bg.split(2))
-    train_routine(mod, opt, trn_ds, val_ds, tst_ds, verbose=True)
+    # print("y", torch.unique(dataset.y.reshape(-1, 2)[:, 0]), dataset.y.reshape(-1, 2)[:, 0].shape)
+    return roc_auc_score(dataset.y.cpu().numpy(), sig)
 
 
 def train_routine(mod, opt, trn_ds, val_ds, tst_ds, verbose=False):
@@ -89,22 +74,18 @@ def train_routine(mod, opt, trn_ds, val_ds, tst_ds, verbose=False):
     trn_ds.pos1 = trn_ds.pos1.to(torch.long)
     val_ds.pos1 = val_ds.pos1.to(torch.long)
     tst_ds.pos1 = tst_ds.pos1.to(torch.long)
-    batch_size = val_ds.y.shape[0]
+    batch_size = tst_ds.y.shape[0]
     vprint(f"batch size{batch_size}")
-
-    length = max(2 * batch_size, tst_ds.y.shape[0], val_ds.y.shape[0])
-    even_mask = torch.zeros((length,), dtype=torch.bool)
-    for i in range(length // 2):
-        even_mask[i * 2] = 1
 
     best_val = 0
     tst_score = 0
     early_stop = 0
-    for i in range(2000):
+    train_idx = 0
+    for i in range(1500):
         t1 = time.time()
-        loss = train(mod, opt, trn_ds, batch_size, even_mask)
+        loss, train_idx = train(mod, opt, trn_ds, batch_size, train_idx)
         t2 = time.time()
-        val_score = test(mod, val_ds, even_mask)
+        val_score = test(mod, val_ds)
         vprint(f"trn: time {t2-t1:.2f} s, loss {loss:.4f} val {val_score:.4f}",
                end=" ")
         early_stop += 1
@@ -112,38 +93,58 @@ def train_routine(mod, opt, trn_ds, val_ds, tst_ds, verbose=False):
             early_stop = 0
             best_val = val_score
             if verbose:
-                tst_score = test(mod, tst_ds, even_mask)
+                tst_score = test(mod, tst_ds)
             vprint(f"tst {tst_score:.4f}")
         else:
             vprint()
-        if early_stop > 200:
-            break
-    vprint(f"end test {tst_score:.3f} time {(t2-t1)/8:.3f} s")
-    return val_score
+    vprint(f"end test {tst_score:.3f} time {t2-t1:.3f} s")
+    return best_val
 
 
-def work(device="cpu", dsname="Celegans"):  # mod_params=(32, 2, 1, 0.0), lr=3e-4
+def work(device="cpu", dsname="Celegans"):
     device = torch.device(device)
     bg = load_dataset(dsname)
     bg.to(device)
     bg.preprocess()
     bg.setPosDegreeFeature()
-    trn_ds = dataset(*bg.split(0))
-    val_ds = dataset(*bg.split(1))
-    tst_ds = dataset(*bg.split(2))
+    trn_ds = Dataset(*bg.split(0))
+    val_ds = Dataset(*bg.split(1))
+    tst_ds = Dataset(*bg.split(2))
 
     def selparam(trial):
+        nonlocal bg, trn_ds, val_ds, tst_ds
+        if random.random() < 0.1:
+            bg = load_dataset(dsname)
+            bg.to(device)
+            bg.preprocess()
+            bg.setPosDegreeFeature()
+            trn_ds = Dataset(*bg.split(0))
+            val_ds = Dataset(*bg.split(1))
+            tst_ds = Dataset(*bg.split(2))
         lr = trial.suggest_categorical("lr",
                                        [0.0005, 0.001, 0.005, 0.01, 0.05])
         layer1 = trial.suggest_int("layer1", 1, 3)
-        layer2 = trial.suggest_int("layer2", 1, 3)
-        hidden_dim = trial.suggest_categorical("hidden_dim", [16, 32, 48, 64])
-        dp = trial.suggest_float("dp", 0.0, 0.9, step=0.05)
-        return valparam(layer1, layer2, dp, hidden_dim, lr)
+        layer2 = trial.suggest_int("layer2", 1, 2)
+        hidden_dim = trial.suggest_categorical("hidden_dim", [8, 16, 24])
+        dp1 = trial.suggest_float("dp1", 0.0, 0.7, step=0.05)
+        dp2 = trial.suggest_float("dp2", 0.0, 0.5, step=0.05)
+        dp3 = trial.suggest_float("dp3", 0.0, 0.5, step=0.05)
+        return valparam(hidden_dim, layer1, layer2, dp1, dp2, dp3, lr)
 
-    def valparam(layer1, layer2, dp, hidden_dim, lr):
-        mod = WLGNN(torch.max(bg.x),
-                    *(hidden_dim, layer1, layer2, dp)).to(device)
+    def valparam(hidden_dim, layer1, layer2, dp1, dp2, dp3, lr):
+        if bg.x.shape[1] > 0:
+            mod = Net(bg.max_x,
+                      hidden_dim,
+                      layer1,
+                      layer2,
+                      dp1,
+                      dp2,
+                      dp3,
+                      use_feat=True,
+                      feat=bg.x).to(device)
+        else:
+            mod = Net(bg.max_x, hidden_dim, layer1, layer2, dp1, dp2,
+                      dp3).to(device)
         opt = Adam(mod.parameters(), lr=lr)
         return train_routine(mod, opt, trn_ds, val_ds, tst_ds)
 
@@ -152,62 +153,138 @@ def work(device="cpu", dsname="Celegans"):  # mod_params=(32, 2, 1, 0.0), lr=3e-
                                 ".db",
                                 study_name=dsname,
                                 load_if_exists=True)
-    study.optimize(selparam, n_trials=200)
+    print(
+        f"storage {'sqlite:///' + args.path + dsname + '.db'} study_name {dsname}"
+    )
+    study.optimize(selparam, n_trials=100)
 
 
-def testparam(device="cpu", dsname="Celegans"):  # mod_params=(32, 2, 1, 0.0), lr=3e-4
+def testparam(device="cpu",
+              dsname="Celegans"):  # mod_params=(32, 2, 1, 0.0), lr=3e-4
     device = torch.device(device)
-    bg = load_dataset(dsname)
-    bg.to(device)
-    bg.preprocess()
-    bg.setPosDegreeFeature()
-    trn_ds = dataset(*bg.split(0))
-    val_ds = dataset(*bg.split(1))
-    tst_ds = dataset(*bg.split(2))
 
-    def valparam(layer1, layer2, dp, hidden_dim, lr):
-        mod = WLGNN(torch.max(bg.x),
-                    *(hidden_dim, layer1, layer2, dp)).to(device)
+    def valparam(hidden_dim, layer1, layer2, dp1, dp2, dp3, lr):
+        if bg.x.shape[1] > 0:
+            print("use_feat")
+            mod = Net(bg.max_x,
+                      hidden_dim,
+                      layer1,
+                      layer2,
+                      dp1,
+                      dp2,
+                      dp3,
+                      use_feat=True,
+                      feat=bg.x).to(device)
+        else:
+            mod = Net(bg.max_x, hidden_dim, layer1, layer2, dp1, dp2,
+                      dp3).to(device)
         opt = Adam(mod.parameters(), lr=lr)
         return train_routine(mod, opt, trn_ds, val_ds, tst_ds, verbose=True)
-
-    study = optuna.create_study(direction="maximize",
-                                storage="sqlite:///" + args.path + dsname +
-                                ".db",
-                                study_name=dsname,
-                                load_if_exists=True)
-    print("best param", study.best_params)
-    valparam(**(study.best_params))    
-    
-
-
-def reproduce(device, ds):
-    device = torch.device(device)
-    bg = load_dataset(ds)
-    bg.to(device)
-    bg.preprocess()
-    bg.setPosDegreeFeature()
-    trn_ds = dataset(*bg.split(0))
-    val_ds = dataset(*bg.split(1))
-    tst_ds = dataset(*bg.split(2))
-    
-    lr = 1e-2
-    if ds == "PB":
-        hidden_dim = 96
-    elif ds == "Yeast":
-        hidden_dim = 64
-    elif ds == "Celegans":
-        hidden_dim = 32
-    elif ds == "Power":
-        hidden_dim = 64
-        #lr = 1e-2
-    else:
-        raise NotImplementedError
-
-    mod = Model_HY(torch.max(bg.x[2]), *(hidden_dim, 2, 3, 0)).to(device)
-    opt = Adam(mod.parameters(), lr=lr)
-    train_routine(mod, opt, trn_ds, val_ds, tst_ds, verbose=True)
-
+    best_params = {
+        'Celegans': {
+            'dp1': 0.2,
+            'dp2': 0.1,
+            'dp3': 0.3,
+            'hidden_dim': 32,
+            'layer1': 3,
+            'layer2': 2,
+            'lr': 0.01
+        },
+        'USAir': {
+            'dp1': 0.1,
+            'dp2': 0.0,
+            'dp3': 0.3,
+            'hidden_dim': 24,
+            'layer1': 3,
+            'layer2': 1,
+            'lr': 0.005
+        },
+        'PB': {
+            'dp1': 0.55,
+            'dp2': 0.0,
+            'dp3': 0.35,
+            'hidden_dim': 24,
+            'layer1': 3,
+            'layer2': 2,
+            'lr': 0.05
+        },
+        'NS': {
+            'dp1': 0.7,
+            'dp2': 0.0,
+            'dp3': 0.1,
+            'hidden_dim': 32,
+            'layer1': 3,
+            'layer2': 1,
+            'lr': 0.005
+        },
+        'Ecoli': {
+            'dp1': 0.3,
+            'dp2': 0.0,
+            'dp3': 0.4,
+            'hidden_dim': 32,
+            'layer1': 3,
+            'layer2': 1,
+            'lr': 0.01
+        },
+        'Router': {
+            'dp1': 0.35,
+            'dp2': 0.05,
+            'dp3': 0.05,
+            'hidden_dim': 24,
+            'layer1': 2,
+            'layer2': 1,
+            'lr': 0.005
+        },
+        'Power': {
+            'dp1': 0.65,
+            'dp2': 0.25,
+            'dp3': 0.1,
+            'hidden_dim': 8,
+            'layer1': 3,
+            'layer2': 2,
+            'lr': 0.01
+        },
+        'Yeast': {
+            'dp1': 0.0,
+            'dp2': 0.0,
+            'dp3': 0.0,
+            'hidden_dim': 32,
+            'layer1': 3,
+            'layer2': 1,
+            'lr': 0.05
+        },
+        'Cora': {
+            'dp1': 0.4,
+            'dp2': 0.05,
+            'dp3': 0.3,
+            'hidden_dim': 24,
+            'layer1': 1,
+            'layer2': 1,
+            'lr': 0.005
+        },
+        'Citeseer': {
+            'dp1': 0.65,
+            'dp2': 0.0,
+            'dp3': 0.1,
+            'hidden_dim': 24,
+            'layer1': 2,
+            'layer2': 1,
+            'lr': 0.05
+        }
+    }
+    params = best_params[dsname]
+    print("best param", params)
+    for i in range(10):
+        set_seed(i)
+        print(f"repeat {i}")
+        bg = load_dataset(dsname)
+        bg.to(device)
+        bg.preprocess()
+        bg.setPosDegreeFeature()
+        trn_ds = Dataset(*bg.split(0))
+        val_ds = Dataset(*bg.split(1))
+        tst_ds = Dataset(*bg.split(2))
+        valparam(**(params))
 
 
 if __name__ == "__main__":
@@ -215,9 +292,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='')
     parser.add_argument('--dataset', type=str, default="Yeast")
     parser.add_argument('--device', type=int, default=0)
-    parser.add_argument('--path', type=str, default="opt/")
+    parser.add_argument('--path', type=str, default="Opt/")
     parser.add_argument('--test', action="store_true", default=False)
-    parser.add_argument('--reproduce', action="store_true", default=True)
     args = parser.parse_args()
     if args.device < 0:
         args.device = "cpu"
@@ -226,8 +302,5 @@ if __name__ == "__main__":
     print(args.device)
     if args.test:
         testparam(args.device, args.dataset)
-    elif args.reproduce:
-        reproduce(args.device, args.dataset)
     else:
         work(args.device, args.dataset)
-    # main(args.device, args.dataset, lr=1e-3)
