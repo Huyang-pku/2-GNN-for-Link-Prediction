@@ -1,9 +1,13 @@
 import torch
 from torch import Tensor
-from torch_geometric.nn.conv import edge_conv
-from torch_geometric.utils.convert import to_cugraph
-from torch_sparse.tensor import to
+from torch_scatter import scatter_add
+from scipy.sparse import csr_matrix
+from torch_sparse import spspmm
+import numpy as np
 
+@torch.jit.script
+def degree(ei: Tensor, num_node: int):
+    return scatter_add(torch.ones_like(ei[1]), ei[1], dim_size=num_node)
 
 @torch.jit.script
 def set_mul(a: Tensor, b: Tensor):
@@ -30,6 +34,7 @@ def check_in_set(target, set):
 
 @torch.jit.script
 def get_ei2(n_node: int, pos_edge, pred_edge):
+
     edge = torch.cat((pos_edge, pred_edge), dim=-1)  #pos.transpose(0, 1)
     idx = torch.arange(edge.shape[1], device=edge.device)
     idx_pos = torch.arange(pos_edge.shape[1], device=edge.device)
@@ -39,6 +44,105 @@ def get_ei2(n_node: int, pos_edge, pred_edge):
     ]
     return torch.cat(edge2, dim=0).t()
 
+def compute_all_neg(n_node, edge_index):
+    ei = edge_index.cpu().numpy()
+    adj = np.zeros([n_node, n_node], dtype = bool)
+    adj[ei[0], ei[1]] = True
+    base = np.arange(n_node)
+    edge0 = np.expand_dims(base, 1).repeat(n_node, axis=1).flatten()
+    edge1 = np.expand_dims(base, 0).repeat(n_node, axis=0).flatten()
+    mask = (edge0 == edge1) + (adj[edge0, edge1])
+    all_neg = torch.tensor([edge0[~mask], edge1[~mask]], dtype=torch.long, device=edge_index.device)
+    all_neg = all_neg[:,all_neg[0]<all_neg[1]]
+    all_neg_r = torch.cat([all_neg[1].unsqueeze(0), all_neg[0].unsqueeze(0)], 0)
+    return torch.cat([all_neg, all_neg_r], 0).t().reshape(-1, 2)
+
+def sparse_bmm(edge_index_0, a, edge_index_1, b, n, fast=False):
+    m = a.shape[-1]
+    if not fast:
+        x = []
+        for i in range(m):
+            idx, val = spspmm(edge_index_0, a[:, i], edge_index_1, b[:, i], n,
+                              n, n, True)
+            x.append(val)
+            ei = idx
+        x = torch.stack(x).t()
+    else:
+        m0 = edge_index_0.shape[1]
+        m1 = edge_index_1.shape[1]
+        a = a.t().reshape(-1)
+        b = b.t().reshape(-1)
+        edge_index_0 = torch.stack([edge_index_0 for _ in range(m)],
+                                   1).reshape(2, -1)
+        edge_index_1 = torch.stack([edge_index_1 for _ in range(m)],
+                                   1).reshape(2, -1)
+        tem0 = (torch.arange(m) * n).unsqueeze(1).expand(-1, 2 * m0).reshape(
+            -1, 2).t().to(edge_index_0.device)
+        tem1 = (torch.arange(m) * n).unsqueeze(1).expand(-1, 2 * m1).reshape(
+            -1, 2).t().to(edge_index_1.device)
+        edge_index_0 += tem0
+        edge_index_1 += tem1
+        #sm1 = torch.sparse.FloatTensor(edge_index_0, a, torch.Size([n * m, n * m]))
+        #sm2 = torch.sparse.FloatTensor(edge_index_1, b, torch.Size([n * m, n * m]))
+        #sm = torch.sparse.mm(sm1, sm2).coalesce()
+        #ind, val = sm.indices(), sm.values()
+        ind, val = spspmm(edge_index_0, a, edge_index_1, b, n * m, n * m,
+                          n * m, True)
+        return torch.sparse_coo_tensor(ind[:, :ind.shape[1] // m],
+                                       val.reshape(m, -1).t(),
+                                       (n, n, m)).coalesce()
+
+    return torch.sparse_coo_tensor(ei, x, (n, n, m)).coalesce()
+
+
+def sparse_cat(x, edge_index, v):
+    edges = merge(x.indices(), edge_index, x.size(0))
+    tem0 = torch.zeros(edges.shape[1], x.values().shape[-1], device=x.device)
+    tem1 = torch.zeros(edges.shape[1], v.shape[-1], device=x.device)
+    mask0 = edge_mask(edges, x.indices(), x.size(0))
+    mask1 = edge_mask(edges, edge_index, x.size(0))
+    tem0[mask0] = x.values()
+    tem1[mask1] = v
+    return torch.from_numpy(edges).to(torch.long).to(v.device), torch.cat(
+        [tem0, tem1], 1)
+
+
+def merge(edge0, edge1, n):
+    m0 = csr_matrix((np.ones((edge0.shape[1]), dtype=int),
+                     (edge0[0].cpu().numpy(), edge0[1].cpu().numpy())),
+                    shape=(n, n)).tolil()
+    #m1 = csr_matrix((np.ones((edge1.shape[1]), dtype=int), (edge1[0].cpu().numpy(), edge1[1].cpu().numpy())), shape = (n, n)).tolil()
+    m0[edge1[0].cpu().numpy().tolist(), edge1[1].cpu().numpy().tolist()] = 1
+    return np.stack((m0.nonzero()[0], m0.nonzero()[1]))
+
+
+def edge_mask(edge0, edge1, n):
+    mask = csr_matrix((np.ones((edge0.shape[1]), dtype=int), (edge0[0], edge0[1])),shape=(n, n)).tolil()
+    mask[edge1[0].cpu().numpy().tolist(), edge1[1].cpu().numpy().tolist()] = 2
+    mask = mask.tocsr()
+    import pdb
+    if (mask.data==2).sum() != edge1.shape[1]:
+        pdb.set_trace()
+    return torch.tensor(mask.data == 2, dtype=torch.bool, device=edge1.device)
+
+
+def edge_list(edge0, edge1, n):
+    pairs = merge(edge0, edge1, n)
+    m = csr_matrix(
+        (np.arange(1, pairs.shape[1] + 1, dtype=int), (pairs[0], pairs[1])),
+        shape=(n, n)).tolil()
+    return torch.tensor(m[edge1[0].tolist(), edge1[1].tolist()].data[0],
+                        dtype=torch.long,
+                        device=edge1.device) - 1
+
+
+def add_zero(x, edge0, edge1):
+    mask = edge_mask(edge0, edge1, x.shape[0])
+    xx = torch.zeros((mask.shape[0], x.shape[1]),
+                     dtype=torch.float,
+                     device=x.device)
+    xx[mask] = x
+    return xx
 
 @torch.jit.script
 def blockei2(ei2, blocked_idx):
@@ -59,15 +163,22 @@ def mask2idx(mask):
 
 
 #@torch.jit.script
-def sample_block(sample_idx, ea, size, ei, ei2):
+def sample_block(sample_idx, size, ei, ei2=None):
+    ea = torch.ones((ei.shape[-1],), dtype=torch.float, device=ei.device)
     ea_new = ea[torch.logical_not(idx2mask(ei.shape[1], sample_idx))]
     ei_new = ei[:, torch.logical_not(idx2mask(ei.shape[1], sample_idx))]
-    pos_pos_new = ei[:, sample_idx].t()
-    ei2_new = blockei2(ei2, sample_idx)
-    #print(ei_new, ea_new, (size, size))
+    ei2_new = blockei2(ei2, sample_idx) if ei2 is not None else None
     adj = torch.sparse_coo_tensor(ei_new, ea_new, (size, size))
-    x_new = torch.sparse.sum(adj, dim=1).to_dense().to(torch.int64).reshape(size, 1)
-    return ei_new, x_new, pos_pos_new, ei2_new
+    x_new = torch.sparse.sum(adj, dim=1).to_dense().to(torch.int64).reshape(-1)
+    return ei_new, x_new, ei2_new
+
+def reverse(edge_index):
+    tem0 = 1 - (edge_index[0] > torch.div(edge_index[0], 2, rounding_mode='floor') * 2).to(torch.long) * 2
+    tem1 = 1 - (edge_index[1] > torch.div(edge_index[0], 2, rounding_mode='floor') * 2).to(torch.long) * 2
+    edge = torch.cat([(edge_index[0] + tem0).unsqueeze(0), edge_index[1].unsqueeze(0)])
+    edge_r = torch.cat([edge_index[0].unsqueeze(0), (edge_index[1] + tem1).unsqueeze(0)])
+    #return edge_index
+    return edge, edge_r
 
 import math
 
@@ -85,6 +196,16 @@ def double(x, for_index = False):
         x = x.reshape(-1, 1).t().squeeze()
     return x
 
+def all_neg_edges(edge_index, n):
+    row = torch.arange(n).expand(n,n).reshape(n*n, 1).cuda()
+    col = torch.arange(n).t().expand(n,n).reshape(n*n, 1).cuda()
+    edge = torch.cat([row, col], -1)
+    edge = edge[edge[:, 0] >= edge[:, 1], :]
+    for i in range(edge_index.shape[1]):
+        p, q = edge_index[:, i]
+        edge = edge[(edge[:, 0] != p) | (edge[:, 1] != q), :]
+    edge = edge.cpu()
+    return edge.t()
 
 def random_split_edges(data, val_ratio: float = 0.05,
                            test_ratio: float = 0.1):
