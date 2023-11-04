@@ -8,6 +8,8 @@ About
 It first takes node feature or node degree as initial input, then use 1-WL-GNN and pooling function to obtain link representation, finally use 2-WL-GNN to get prediction 
 score for every questioned links. We adopt four different 2-WL tests: 2-WL, Local 2-WL, 2-FWL, Local 2-FWL, depending on which we construct four types of 2-WL-GNN layers.
 
+Paper: https://arxiv.org/abs/2206.09567
+
 Denote graph $G=(V,E), V=[n]$, 
 four 2-WL tests define neighborhood of link $(p,q)$ as follows:
 
